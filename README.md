@@ -13,8 +13,7 @@ This guide documents the complete workflow for evaluating LLMs on SWE-bench usin
 5. [Phase 1: Inference — Generating Patches](#phase-1-inference--generating-patches)
 6. [Phase 2: Evaluation — Running Docker Tests](#phase-2-evaluation--running-docker-tests)
 7. [Interpreting Results](#interpreting-results)
-8. [Common Failure Modes](#common-failure-modes)
-9. [Cost Reference](#cost-reference)
+8. [Quick Reference](#quick-reference)
 
 ---
 
