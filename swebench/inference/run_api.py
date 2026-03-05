@@ -42,6 +42,8 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    # OpenRouter models
+    "z-ai/glm-5": 202_752,
 }
 
 # The cost per token for each model input.
@@ -61,6 +63,8 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    # OpenRouter models
+    "z-ai/glm-5": 0.00000080,  # $0.80 / 1M tokens
 }
 
 # The cost per token for each model output.
@@ -80,6 +84,8 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    # OpenRouter models
+    "z-ai/glm-5": 0.00000256,  # $2.56 / 1M tokens
 }
 
 # used for azure
@@ -88,6 +94,127 @@ ENGINES = {
     "gpt-4-0613": "gpt-4",
     "gpt-4-32k-0613": "gpt-4-32k",
 }
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# cl100k_base is GPT-4's encoding; a reasonable approximation for most modern LLMs
+_OPENROUTER_ENCODING = tiktoken.get_encoding("cl100k_base")
+
+
+def rough_tokenize(string: str) -> int:
+    """Estimate token count using cl100k_base (GPT-4 encoding).
+    More accurate than chars/4 for most modern LLMs including GLM series."""
+    return len(_OPENROUTER_ENCODING.encode(string))
+
+
+@retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
+def call_openrouter(client, model_name_or_path, inputs, temperature, top_p, **model_args):
+    """
+    Calls the OpenRouter API (OpenAI-compatible) to generate completions.
+
+    Args:
+    client (openai.OpenAI): OpenAI client configured with OpenRouter base_url.
+    model_name_or_path (str): The OpenRouter model identifier.
+    inputs (str): The prompt string (first line = system message, rest = user message).
+    temperature (float): Sampling temperature.
+    top_p (float): Top-p sampling parameter.
+    **model_args: Additional keyword arguments forwarded to the API.
+    """
+    system_message, user_message = inputs.split("\n", 1)
+    try:
+        response = client.chat.completions.create(
+            model=model_name_or_path,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            **model_args,
+        )
+        input_tokens = response.usage.prompt_tokens
+        output_tokens = response.usage.completion_tokens
+        cost = calc_cost(model_name_or_path, input_tokens, output_tokens)
+        return response, cost
+    except openai.BadRequestError as e:
+        if e.code == "context_length_exceeded":
+            print("Context length exceeded")
+            return None, 0.0
+        raise e
+
+
+def openrouter_inference(
+    test_dataset,
+    model_name_or_path,
+    output_file,
+    model_args,
+    existing_ids,
+    max_cost,
+):
+    """
+    Runs inference on a dataset using the OpenRouter API (OpenAI-compatible).
+
+    Args:
+    test_dataset (datasets.Dataset): The dataset to run inference on.
+    model_name_or_path (str): The OpenRouter model identifier (e.g. 'z-ai/glm-5').
+    output_file (str): Path to the output JSONL file.
+    model_args (dict): Extra keyword arguments forwarded to the API.
+    existing_ids (set): Instance IDs already processed (for resuming).
+    max_cost (float): Maximum total USD to spend before stopping.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY", None)
+    if api_key is None:
+        raise ValueError(
+            "Must provide an API key. Expected in OPENROUTER_API_KEY environment variable."
+        )
+    print(f"Using OpenRouter key {'*' * max(0, len(api_key) - 5) + api_key[-5:]}")
+    client = openai.OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+
+    # Filter instances whose prompt exceeds the model context window
+    context_limit = MODEL_LIMITS.get(model_name_or_path, 200_000)
+    test_dataset = test_dataset.filter(
+        lambda x: rough_tokenize(x["text"]) <= context_limit,
+        desc="Filtering by context length",
+        load_from_cache_file=False,
+    )
+
+    temperature = model_args.pop("temperature", 0.2)
+    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    print(f"Using temperature={temperature}, top_p={top_p}")
+    print(f"Filtered to {len(test_dataset)} instances")
+
+    total_cost = 0.0
+    with open(output_file, "a+") as f:
+        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
+            instance_id = datum["instance_id"]
+            if instance_id in existing_ids:
+                continue
+            output_dict = {
+                "instance_id": instance_id,
+                "model_name_or_path": model_name_or_path,
+                "text": f"{datum['text']}\n\n",
+            }
+            result = call_openrouter(
+                client,
+                model_name_or_path,
+                output_dict["text"],
+                temperature,
+                top_p,
+                **model_args,
+            )
+            if result is None or result[0] is None:
+                logger.warning(f"Skipping {instance_id} due to failed API call.")
+                continue
+            response, cost = result
+            completion = response.choices[0].message.content
+            total_cost += cost
+            print(f"Total Cost: ${total_cost:.4f}")
+            output_dict["full_output"] = completion
+            output_dict["model_patch"] = extract_diff(completion)
+            print(json.dumps(output_dict), file=f, flush=True)
+            if max_cost is not None and total_cost >= max_cost:
+                print(f"Reached max cost ${max_cost}, exiting")
+                break
 
 
 def calc_cost(model_name, input_tokens, output_tokens):
@@ -100,12 +227,18 @@ def calc_cost(model_name, input_tokens, output_tokens):
     Returns:
     float: The cost of the response.
     """
+    if model_name not in MODEL_COST_PER_INPUT or model_name not in MODEL_COST_PER_OUTPUT:
+        logger.warning(
+            f"Model {model_name} not found in cost tables, cost tracking skipped."
+        )
+        logger.info(f"input_tokens={input_tokens}, output_tokens={output_tokens}, cost=N/A")
+        return 0.0
     cost = (
         MODEL_COST_PER_INPUT[model_name] * input_tokens
         + MODEL_COST_PER_OUTPUT[model_name] * output_tokens
     )
     logger.info(
-        f"input_tokens={input_tokens}, output_tokens={output_tokens}, cost={cost:.2f}"
+        f"input_tokens={input_tokens}, output_tokens={output_tokens}, cost={cost:.6f}"
     )
     return cost
 
@@ -448,6 +581,8 @@ def main(
     output_dir,
     model_args,
     max_cost,
+    openrouter=False,
+    num_instances=None,
 ):
     if shard_id is None and num_shards is not None:
         logger.warning(
@@ -483,6 +618,9 @@ def main(
     dataset = dataset[split]
     lens = np.array(list(map(len, dataset["text"])))
     dataset = dataset.select(np.argsort(lens))
+    if num_instances is not None:
+        dataset = dataset.select(range(min(num_instances, len(dataset))))
+        logger.info(f"Limited to first {len(dataset)} instances")
     if len(existing_ids) > 0:
         dataset = dataset.filter(
             lambda x: x["instance_id"] not in existing_ids,
@@ -499,12 +637,17 @@ def main(
         "existing_ids": existing_ids,
         "max_cost": max_cost,
     }
-    if model_name_or_path.startswith("claude"):
+    if openrouter:
+        openrouter_inference(**inference_args)
+    elif model_name_or_path.startswith("claude"):
         anthropic_inference(**inference_args)
     elif model_name_or_path.startswith("gpt"):
         openai_inference(**inference_args)
     else:
-        raise ValueError(f"Invalid model name or path {model_name_or_path}")
+        raise ValueError(
+            f"Invalid model name or path {model_name_or_path}. "
+            "Use --openrouter for OpenRouter models, or ensure the name starts with 'claude'/'gpt'."
+        )
     logger.info("Done!")
 
 
@@ -525,8 +668,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        help="Name of API model. Update MODEL* constants in this file to add new models.",
-        choices=sorted(list(MODEL_LIMITS.keys())),
+        required=True,
+        help="Name of API model. For OpenRouter models use --openrouter flag.",
     )
     parser.add_argument(
         "--shard_id",
@@ -557,7 +700,20 @@ if __name__ == "__main__":
         "--max_cost",
         type=float,
         default=None,
-        help="Maximum cost to spend on inference.",
+        help="Maximum total USD cost to spend on inference.",
+    )
+    parser.add_argument(
+        "--openrouter",
+        action="store_true",
+        default=False,
+        help="Use OpenRouter API (OpenAI-compatible). Reads OPENROUTER_API_KEY from environment.",
+    )
+    parser.add_argument(
+        "--num_instances",
+        type=int,
+        default=None,
+        help="Limit inference to the first N instances (sorted by prompt length). "
+             "Useful for quick tests.",
     )
     args = parser.parse_args()
     main(**vars(args))
